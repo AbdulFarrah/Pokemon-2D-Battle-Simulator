@@ -11,6 +11,7 @@ build/pokemon_2D_Game/
 build/pokemon_2D_Game/localpycs/
 build/pokemon_ONLINE_Game/
 build/pokemon_ONLINE_Game/localpycs/
+data/pokemon.json
 data/Images/Abomasnow.png
 data/Images/Abra.png
 data/Images/Absol.png

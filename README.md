@@ -231,6 +231,15 @@ Simply sharing the invite code is not sufficient if the host is behind a network
 
 ## Data Pipeline
 
+The game uses two JSON datasets:
+
+* `data/pokemon.json` — generated locally by `pokemon_fetcher.py`. It contains the Pokémon data used by the game, including encoded image information.
+* `data/data.json` — contains the move data used by the battle system.
+
+`pokemon.json` is intentionally **not included in the repository** because it contains encoded Pokémon image data and can become very large.
+
+The provided fetcher scripts can recreate and update the required data.
+
 The repository includes scripts for maintaining the Pokémon and move datasets.
 
 The intended data flow is:
@@ -259,6 +268,61 @@ image_fetcher.py
 ```
 
 These scripts are useful when updating the game's Pokémon database rather than manually maintaining every Pokémon entry and image.
+
+### Generating the Required Data
+
+Before running the game from a fresh clone, generate the Pokémon dataset and its associated image files.
+
+From the project root, enter the `data` directory:
+
+```powershell
+cd data
+```
+
+Run the scripts in this order:
+
+```powershell
+python pokemon_fetcher.py
+python move_fetcher.py
+python image_fetcher.py
+```
+
+The scripts perform the following steps:
+
+1. **`pokemon_fetcher.py`** — creates/updates `pokemon.json` with Pokémon data and encoded image information.
+2. **`move_fetcher.py`** — creates/updates `data.json` with move information referenced by the Pokémon dataset.
+3. **`image_fetcher.py`** — generates the Pokémon image files used by the game.
+
+After the scripts finish, return to the project root:
+
+```powershell
+cd ..
+```
+
+The project can then be started with:
+
+```powershell
+python main.py
+```
+
+The data-generation scripts retrieve information from the web, so an active internet connection is required when running them.
+
+### Updating the Data
+
+The same commands can be used later to update the local Pokémon and move datasets:
+
+```powershell
+cd data
+python pokemon_fetcher.py
+python move_fetcher.py
+python image_fetcher.py
+cd ..
+```
+
+The Pokémon fetcher currently contains generation mappings through Generation 9.
+
+Because `pokemon.json` and the generated Pokémon images are excluded from Git, a fresh clone should run the data-generation pipeline before starting the game.
+
 
 ---
 
@@ -367,6 +431,8 @@ background.png
 
 The generated Pokémon PNG files can be recreated using the data-generation pipeline.
 
+Once `pokemon.json`, `data.json`, and all Pokémon PNG files have been generated, open `data/gallery.html` in a web browser to view a static gallery of all available Pokémon.
+
 ---
 
 ## Recommended Data Update Order
@@ -412,7 +478,6 @@ Pokemon-2D-Battle-Simulator/
 │   │   └── background.png
 │   │
 │   ├── data.json
-│   ├── pokemon.json
 │   │
 │   ├── image_fetcher.py
 │   ├── move_check.py
@@ -693,9 +758,7 @@ directly instead of using the packaged executable.
 
 ## Runtime Resources
 
-The game loads its runtime resources using paths that support both normal Python execution and PyInstaller's bundled application environment.
-
-The required runtime data includes:
+The game requires the following runtime resources:
 
 ```text
 data/pokemon.json
@@ -703,9 +766,22 @@ data/data.json
 data/Images/
 ```
 
-The Pokémon image files must exist in `data/Images/` for Pokémon whose images are displayed by the game.
+`data/pokemon.json` is generated locally using:
 
-The data-generation scripts can be used to recreate those generated images.
+```powershell
+cd data
+python pokemon_fetcher.py
+```
+
+The Pokémon images are generated using:
+
+```powershell
+python image_fetcher.py
+```
+
+`data/data.json` contains the move information required by the game.
+
+The repository intentionally stores only the static `background.png` image. Generated Pokémon image files are excluded from Git and can be recreated using the provided data-generation scripts.
 
 ---
 
