@@ -1,3 +1,11 @@
+def get_online_role_from_click(pos, host_button, join_button):
+    if host_button.is_clicked(pos):
+        return True
+    if join_button.is_clicked(pos):
+        return False
+    return None
+
+
 def run_ui_setup():
     import pygame
     from src.online_setup import online_setup # type: ignore
@@ -122,6 +130,9 @@ def run_ui_setup():
             if event.type == pygame.QUIT:
                 pygame.quit()
                 raise SystemExit
+            if (event.type == pygame.MOUSEBUTTONDOWN
+                    and getattr(event, "button", 0) in (4, 5)):
+                continue
 
             if state == "select_mode":
                 if event.type == pygame.MOUSEBUTTONDOWN:
@@ -137,16 +148,19 @@ def run_ui_setup():
 
             elif state == "online_setup":
                 if event.type == pygame.MOUSEBUTTONDOWN:
-                    if host_button.is_clicked(event.pos):
-                        game_details['is_host'] = True
-                        state = "input_names"
+                    host = get_online_role_from_click(event.pos, host_button, join_button)
+                    if host is not None:
+                        game_details['is_host'] = host
                         input_text = ""
-                        player_name_phase = 1
-                    elif join_button.is_clicked(event.pos):
-                        game_details['is_host'] = False
-                        input_text = ""
-                        state = "input_names"
-                    game_details["conn"] = online_setup(screen,game_details['is_host'])
+                        error_message = ""
+                        try:
+                            game_details["conn"] = online_setup(screen, host)
+                        except (OSError, ValueError) as exc:
+                            error_message = f"Could not set up online play: {exc}"
+                        else:
+                            state = "input_names"
+                            if host:
+                                player_name_phase = 1
 
             elif state == "input_names":
                 if event.type == pygame.KEYDOWN:

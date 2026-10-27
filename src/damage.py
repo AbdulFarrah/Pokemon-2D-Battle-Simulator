@@ -16,6 +16,8 @@ class Damage:
         if move.category == 'Status':
             return [0,0]
         if move.name in self.special_moves:
+            if Type().get_effectiveness(move.type, pokemon2.types) == 0:
+                return [0, 0]
             return [150,0]
         if move.category == 'Physical':
             numerator = (((2 * pokemon1.lv) / 5) + 2) * move.power * (pokemon1.attack/pokemon2.defense)
@@ -35,4 +37,7 @@ class Damage:
         if move.name == 'Self-Destruct' or move.name == 'Selfdestruct':
             recoil = 500
             main = 180
+        if (move.name in ('Explosion', 'Self-Destruct', 'Selfdestruct')
+                and Type().get_effectiveness(move.type, pokemon2.types) == 0):
+            main = 0
         return [main,recoil]

@@ -3966,7 +3966,7 @@
             "Type": "Grass",
             "Category": "Physical",
             "Contest": "Cool",
-            "PP": "\u2014",
+            "PP": "10",
             "Power": "100",
             "Accuracy": "None",
             "Generation": "9"

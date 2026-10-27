@@ -2,29 +2,23 @@ from .pokemon import Pokemon # type: ignore
 from .move import Move # type: ignore
 from .damage import Damage # type: ignore
 from .player import Player # type: ignore
-from collections import Counter
+from copy import copy
 import json
 import random
 import os
+import re
 import sys
 import pygame # type: ignore
-import pickle
 import socket
 import threading
 import time
-import ctypes
-
-def raise_exception_in_main_thread(exc_type):
-    main_thread = threading.main_thread()
-    for thread_id, frame in sys._current_frames().items():
-        if thread_id == main_thread.ident:
-            ctypes.pythonapi.PyThreadState_SetAsyncExc(
-                ctypes.c_long(thread_id),
-                ctypes.py_object(exc_type)
-            )
-            break
+from .network import ProtocolError, receive_message, send_message
 
 class ConnectionLost(Exception):
+    pass
+
+
+class RuntimeDataError(RuntimeError):
     pass
 
 class Game:
@@ -33,19 +27,16 @@ class Game:
     heal_user_moves = ["Recover", "Roost", "Slack Off", "Synthesis", "Soft-Boiled","Softboiled","Moonlight","Milk Drink", "Morning Sun", "Heal Order", "Shore Up", "Lunar Blessing"]
     heal_target_moves = ["Heal Pulse", "Floral Healing", "Wish", "Present"]
     drain_moves = ["Absorb", "Mega Drain", "Giga Drain", "Leech Life", "Drain Punch","Draining Kiss", "Horn Leech", "Oblivion Wing", "Parabolic Charge","Bitter Blade", "Matcha Gotcha", "Bouncy Bubble"]
-    move_log_stack = []
-    move_hitted_stack = []
-    fainted_pokemon = []
-    def __init__(self, settings,screen):
+    def __init__(self, settings, screen, runtime_data=None):
         self.graceful_exit = False
+        self.connection_lost = threading.Event()
         self.gameOver = False
+        self.forfeit_by = None
         self.scroll_offset = 0  
-        with open(self.resource_path('data/pokemon.json'), 'r') as infile:
-            data = json.load(infile)
-            self.pokemons = data['pokemons']
-        with open(self.resource_path('data/data.json'), 'r') as infile:
-            data = json.load(infile)
-            self.moves = data['moves']
+        self.move_log_stack = []
+        self.move_hitted_stack = []
+        self.fainted_pokemon = []
+        self.pokemons, self.moves = runtime_data if runtime_data is not None else self.load_runtime_data()
         self.pokemon_images = self.load_pokemon_images()
         self.screen  = screen
         self.settings = settings
@@ -87,7 +78,10 @@ class Game:
         self.display_team_summary_screen(self.player1)
         self.display_team_summary_screen(self.player2)
         self.damage = Damage()
-        self.background_image = pygame.image.load(self.resource_path("data/Images/background.png")).convert()
+        try:
+            self.background_image = pygame.image.load(self.resource_path("data/Images/background.png")).convert()
+        except (OSError, pygame.error) as exc:
+            raise RuntimeDataError("The required data/Images/background.png file is missing or invalid.") from exc
         self.active_buttons = [] 
         self.selected_action = None 
         self.battle_message = ""
@@ -100,9 +94,69 @@ class Game:
         self.attack_animation_target_pos = None
         self.attack_animation_active = False
 
+    def get_events(self):
+        if getattr(self, "connection_lost", None) is not None and self.connection_lost.is_set():
+            self.connection_and_exit(self.screen)
+        return pygame.event.get()
+
     def quit_game(self):
         pygame.quit()
         raise SystemExit
+
+    @staticmethod
+    def resource_path(relative_path):
+        base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        return os.path.join(base_path, relative_path)
+
+    @classmethod
+    def load_runtime_data(cls):
+        loaded = []
+        for relative_path, collection in (("data/pokemon.json", "pokemons"),
+                                          ("data/data.json", "moves")):
+            path = cls.resource_path(relative_path)
+            try:
+                with open(path, "r", encoding="utf-8") as source:
+                    data = json.load(source)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeDataError(f"Could not load {relative_path}: {exc}") from exc
+            if not isinstance(data, dict) or not isinstance(data.get(collection), list) or not data[collection]:
+                raise RuntimeDataError(f"{relative_path} must contain a non-empty '{collection}' list.")
+            loaded.append(data[collection])
+
+        pokemons, moves = loaded
+        required_stats = ("hp", "attack", "defense", "special_attack", "special_defense", "speed")
+        for index, pokemon in enumerate(pokemons):
+            if not isinstance(pokemon, dict):
+                raise RuntimeDataError(f"Pokémon record {index} is not an object.")
+            if (not isinstance(pokemon.get("Name"), str) or not pokemon["Name"]
+                    or not isinstance(pokemon.get("Types"), list) or not pokemon["Types"]
+                    or not isinstance(pokemon.get("Moves"), list)
+                    or any(not isinstance(move_name, str) for move_name in pokemon["Moves"])
+                    or type(pokemon.get("Generation")) is not int):
+                raise RuntimeDataError(f"Pokémon record {index} is missing its name, types, or move list.")
+            for stat in required_stats:
+                if type(pokemon.get(stat)) not in (int, float) or pokemon[stat] <= 0:
+                    raise RuntimeDataError(f"Pokémon {pokemon['Name']} has an invalid {stat} value.")
+        for index, move in enumerate(moves):
+            if not isinstance(move, dict) or any(not isinstance(move.get(field), str) or not move[field]
+                                                  for field in ("Name", "Type", "Category", "Contest", "PP",
+                                                                "Power", "Accuracy")):
+                raise RuntimeDataError(f"Move record {index} is missing required fields.")
+            try:
+                if int(move["PP"]) <= 0:
+                    raise ValueError
+            except (ValueError, TypeError):
+                raise RuntimeDataError(f"Move {move['Name']} has invalid PP data.")
+        return pokemons, moves
+
+    def finish_forfeit(self, forfeiting_player):
+        winner = self.player2 if forfeiting_player is self.player1 else self.player1
+        self.forfeit_by = forfeiting_player.name
+        self.display_blackout_message([
+            f"{forfeiting_player.name} forfeited the match...",
+            f"{winner.name} wins!",
+        ])
+        self.gameOver = True
     
     def monitor_connection(self, conn):
         conn.settimeout(0.1)
@@ -121,7 +175,7 @@ class Game:
                 break
             time.sleep(0.1)
         if not self.graceful_exit:
-            self.connection_and_exit(self.screen)
+            self.connection_lost.set()
 
     def connection_and_exit(self,screen):
         screen.fill((0, 0, 0))
@@ -132,114 +186,167 @@ class Game:
         pygame.display.update()
         pygame.time.delay(3000)
         self.gameOver = True
-        raise_exception_in_main_thread(ConnectionLost)
+        self.graceful_exit = True
+        raise ConnectionLost("Opponent disconnected.")
 
     def send_player_info(self, player):
         data = {
+            'type': 'team',
             'name': player.name,
-            'team': player.pokemons,
-            'battle_size': self.battle_size,
+            'team': [
+                {'name': pokemon.name, 'moves': [move.name for move in pokemon.moves]}
+                for pokemon in player.pokemons
+            ],
+            'battle_size': len(player.pokemons),
         }
-        self.conn.sendall(pickle.dumps(data))
+        send_message(self.conn, data)
+
+    def _decode_opponent_team(self, payload):
+        if payload.get('type') != 'team':
+            raise ProtocolError("Expected a team message.")
+        name = payload.get('name')
+        team_data = payload.get('team')
+        battle_size = payload.get('battle_size')
+        if not isinstance(name, str) or not name.strip() or len(name) > 32:
+            raise ProtocolError("Invalid player name.")
+        if type(battle_size) is not int or not 1 <= battle_size <= 6:
+            raise ProtocolError("Invalid party size.")
+        if not isinstance(team_data, list) or len(team_data) != battle_size:
+            raise ProtocolError("Team size does not match the declared party size.")
+
+        pokemon_by_name = {pokemon['Name']: pokemon for pokemon in self.pokemons}
+        move_by_name = {move['Name']: move for move in self.moves}
+        team = []
+        used_names = set()
+        for entry in team_data:
+            if not isinstance(entry, dict):
+                raise ProtocolError("Invalid Pokémon entry.")
+            pokemon_name = entry.get('name')
+            move_names = entry.get('moves')
+            if not isinstance(pokemon_name, str) or pokemon_name not in pokemon_by_name:
+                raise ProtocolError("Opponent selected an unknown Pokémon.")
+            if pokemon_name in used_names:
+                raise ProtocolError("Opponent team contains duplicate Pokémon.")
+            used_names.add(pokemon_name)
+            source = pokemon_by_name[pokemon_name]
+            if not isinstance(move_names, list) or not 1 <= len(move_names) <= 10:
+                raise ProtocolError("Invalid Pokémon move list.")
+            if any(not isinstance(move_name, str) for move_name in move_names):
+                raise ProtocolError("Invalid move name.")
+            if len(set(move_names)) != len(move_names):
+                raise ProtocolError("Pokémon move list contains duplicates.")
+            if any(move_name not in source.get('Moves', []) or move_name not in move_by_name
+                   for move_name in move_names):
+                raise ProtocolError("Opponent selected a move that Pokémon cannot use.")
+            moves = [Move(move_by_name[move_name]) for move_name in move_names]
+            team.append(Pokemon(moves=moves, json_data=source))
+        return name.strip(), team, battle_size
 
     def receive_opponent_info(self):
-        data = b''
-        opponent_data = None
-        while True:
-            try:
-                part = self.conn.recv(4096)
-                if not part:
-                    break
-                data += part
-                try:
-                    opponent_data = pickle.loads(data)
-                    break
-                except pickle.UnpicklingError:
-                    continue
-            except socket.timeout:
-                continue
-        if opponent_data is None:
-            raise ValueError("Failed to receive valid opponent data.")
-        return opponent_data['name'], opponent_data['team'],opponent_data['battle_size']
+        return self._decode_opponent_team(receive_message(self.conn, pygame.event.pump))
 
     def send_player_move(self, action, arc):
         print(f"[DEBUG] Sending move: action={action}, accuracy={arc}")
-        data = {
-            'type': 'move',
-            'action': action,
-            'accuracy': arc
-        }
-        self.conn.sendall(pickle.dumps(data))
+        if not action:
+            wire_action = {'kind': 'wait'}
+        elif action[0] == 'fight':
+            wire_action = {
+                'kind': 'fight',
+                'pokemon': action[1].name,
+                'move_index': action[2],
+            }
+        elif action[0] == 'switch':
+            wire_action = {'kind': 'switch', 'pokemon_index': action[2]}
+        else:
+            raise ProtocolError("Unsupported battle action.")
+        send_message(self.conn, {'type': 'move', 'action': wire_action, 'accuracy': arc})
 
 
     def receive_opponent_move(self):
-        import pickle
-        import pygame # type: ignore
-        import socket
         print("[DEBUG] Waiting to receive opponent move...")
-        data = b''
-        self.conn.settimeout(0.1)
-        while True:
-            pygame.event.pump()
-            try:
-                part = self.conn.recv(4096)
-                if not part:
-                    continue
-                data += part
-                try:
-                    msg = pickle.loads(data)
-                    if isinstance(msg, dict) and msg.get("type") == "move":
-                        print(f"[DEBUG] Received move message: {msg}")
-                        if 'action' in msg and 'accuracy' in msg:
-                            return msg['action'], msg['accuracy']
-                        else:
-                            print("[⚠️] Incomplete move data:", msg)
-                            data = b''
-                            continue
-                    else:
-                        print("[⚠️] Skipped non-move message:", msg)
-                        data = b''
-                        continue
-                except pickle.UnpicklingError:
-                    continue
-            except socket.timeout:
-                continue
-            except Exception as e:
-                print(f"[ERROR] receive_opponent_move: {e}")
-                break
-        return None, None
+        msg = receive_message(self.conn, pygame.event.pump)
+        if msg.get('type') != 'move' or not isinstance(msg.get('action'), dict):
+            raise ProtocolError("Expected a move message.")
+        accuracy = msg.get('accuracy')
+        if accuracy is not None and (type(accuracy) is not int or not 1 <= accuracy <= 100):
+            raise ProtocolError("Invalid move accuracy roll.")
+        action_data = msg['action']
+        kind = action_data.get('kind')
+        if kind == 'wait':
+            return [], accuracy
+        if kind == 'fight':
+            if accuracy is None:
+                raise ProtocolError("Fight action is missing its accuracy roll.")
+            pokemon_name = action_data.get('pokemon')
+            move_index = action_data.get('move_index')
+            opponent = self.player2
+            if pokemon_name != opponent.current_pokemon.name:
+                raise ProtocolError("Opponent action does not match its active Pokémon.")
+            if type(move_index) is not int or not 0 <= move_index < len(opponent.current_pokemon.moves):
+                raise ProtocolError("Invalid opponent move index.")
+            if opponent.current_pokemon.moves[move_index].pp <= 0:
+                raise ProtocolError("Opponent selected a move with no PP remaining.")
+            return ('fight', opponent.current_pokemon, move_index), accuracy
+        if kind == 'switch':
+            pokemon_index = action_data.get('pokemon_index')
+            opponent = self.player2
+            if type(pokemon_index) is not int or not 0 <= pokemon_index < len(opponent.pokemons):
+                raise ProtocolError("Invalid opponent switch index.")
+            if opponent.pokemons[pokemon_index].hp <= 0 or pokemon_index == opponent.current_pokemon_index:
+                raise ProtocolError("Opponent switch target is unavailable.")
+            return ('switch', opponent.current_pokemon_index, pokemon_index), accuracy
+        raise ProtocolError("Unsupported opponent action.")
+
+
+    def sync_online_speed_tie(self, action1, action2):
+        if self.settings['is_host']:
+            winner = None
+            if (action1 and len(action1) > 1 and action1[0] == 'fight'
+                    and hasattr(action1[1], 'speed')
+                    and action2 and len(action2) > 1 and action2[0] == 'fight'
+                    and hasattr(action2[1], 'speed')
+                    and action1[1].speed == action2[1].speed):
+                winner = random.choice(('host', 'client'))
+            send_message(self.conn, {'type': 'turn_sync', 'speed_tie_winner': winner})
+        else:
+            message = receive_message(self.conn, pygame.event.pump)
+            if message.get('type') != 'turn_sync':
+                raise ProtocolError("Expected a turn synchronization message.")
+            winner = message.get('speed_tie_winner')
+            if winner not in (None, 'host', 'client'):
+                raise ProtocolError("Invalid speed-tie winner.")
+
+        tie_expected = bool(
+            action1 and len(action1) > 1 and action1[0] == 'fight'
+            and action2 and len(action2) > 1 and action2[0] == 'fight'
+            and action1[1].speed == action2[1].speed
+        )
+        if (winner is not None) != tie_expected:
+            raise ProtocolError("Peers disagree about the turn's speed tie.")
+
+        if winner is not None:
+            local_won_tie = (winner == 'host') == self.settings['is_host']
+            winning_player = self.player1 if local_won_tie else self.player2
+            winning_player.current_pokemon.speed += 10
+        return winner
 
 
     def send_switch_message(self, switch_index):
         print(f"[DEBUG] Sending switch message: index={switch_index}")
-        data = {
-            'type': 'switch',
-            'switch_index': switch_index
-        }
-        self.conn.sendall(pickle.dumps(data))
+        send_message(self.conn, {'type': 'switch', 'switch_index': switch_index})
 
 
     def recv_switch_message(self):
-        import pickle
-        data = b''
         print("[DEBUG] Waiting to receive switch message...")
-        while True:
-            try:
-                chunk = self.conn.recv(4096)
-                if not chunk:
-                    continue
-                data += chunk
-                msg = pickle.loads(data)
-                if isinstance(msg, dict) and msg.get("type") == "switch":
-                    print(f"[DEBUG] Received switch message: {msg}")
-                    return msg['switch_index']
-                else:
-                    print("[⚠️] Skipped non-switch message:", msg)
-                    data = b''
-                    continue
-            except Exception as e:
-                print(f"[ERROR] recv_switch_message: {e}")
-                continue
+        msg = receive_message(self.conn, pygame.event.pump)
+        index = msg.get('switch_index')
+        if msg.get('type') != 'switch' or type(index) is not int:
+            raise ProtocolError("Expected a valid switch message.")
+        if not 0 <= index < len(self.player2.pokemons):
+            raise ProtocolError("Opponent switch index is out of range.")
+        if index == self.player2.current_pokemon_index or self.player2.pokemons[index].hp <= 0:
+            raise ProtocolError("Opponent switch target is unavailable.")
+        return index
 
 
     def start_fade_in(self, pokemon_name):
@@ -266,22 +373,25 @@ class Game:
     
     def load_pokemon_images(self):
         images = {}
+        invalid_images = []
         for p in self.pokemons:
             name = p['Name']
-            image_name = name.replace(" ", "_")
+            image_name = re.sub(r'[<>:"/\\\\|?*]', "_", name).replace(" ", "_")
             image_path_w = f"data/Images/{image_name}.png"
             image_path = self.resource_path(image_path_w)
-            if os.path.exists(image_path):
+            try:
                 image = pygame.image.load(image_path).convert_alpha()
                 images[name] = image
+            except (OSError, pygame.error):
+                invalid_images.append(image_name + ".png")
+        if invalid_images:
+            preview = ", ".join(invalid_images[:8])
+            suffix = "..." if len(invalid_images) > 8 else ""
+            raise RuntimeDataError(
+                f"Missing or invalid Pokémon images ({len(invalid_images)}): {preview}{suffix}. "
+                "Run data/image_fetcher.py to add or regenerate them."
+            )
         return images
-
-    def resource_path(self,relative_path):
-        try:
-            base_path = sys._MEIPASS
-        except AttributeError:
-            base_path = os.path.abspath(".")
-        return os.path.join(base_path, relative_path)
     
     def generate_random_pokemons(self, name):
         pokemons = []
@@ -311,12 +421,16 @@ class Game:
         max_width = 80
         max_height = 80
         padding = 100
-        num_columns = self.screen_width // (max_width + padding)
-        total_rows = (len(filtered_pokemons) // num_columns) + (1 if len(filtered_pokemons) % num_columns != 0 else 0)
-        total_height = total_rows * (max_height + 20)
-        max_scroll_y = max(total_height - self.screen_height, 0)
-        scroll_y = 0
-        scroll_speed = 180
+        num_columns = max(1, (self.screen_width - 150) // padding + 1)
+        total_rows = (len(filtered_pokemons) + num_columns - 1) // num_columns
+        visible_height = max(0, self.screen_height - 125)
+        total_height = (total_rows - 1) * 120 + max_height if total_rows else 0
+        max_scroll = max(0, total_height - visible_height)
+        scroll_offset = 0
+        scroll_speed = 120
+        def scroll_by(delta):
+            nonlocal scroll_offset
+            scroll_offset = max(0, min(max_scroll, scroll_offset + delta))
         message = f"{player_name} will now choose {self.battle_size} Pokémon for your team."
         message_timer = 180  
         running = True
@@ -335,12 +449,11 @@ class Game:
                 if image is None:
                     print(f"Missing image for: {name}")
                 if image:
-                    rect = self.display_pokemon_with_image(image, name,x, y + scroll_y, pokemon)
+                    rect = self.display_pokemon_with_image(image, name,x, y - scroll_offset, pokemon)
                     if pokemon['Name'] in [p['Name'] for p in selected_pokemons]:
                         pygame.draw.rect(self.screen, (0, 255, 0), rect, 2)
                     elif rect.collidepoint(mouse_pos):
                         pygame.draw.rect(self.screen, (255, 255, 0), rect, 2)
-                    self.selected_pokemon_rects.append((rect, pokemon))
                     x += padding
                     if x > self.screen_width - 100:
                         x = 50
@@ -362,9 +475,13 @@ class Game:
                 else:
                     message = ""
             pygame.display.flip()
-            for event in pygame.event.get():
+            for event in self.get_events():
                 if event.type == pygame.QUIT:
                     self.quit_game()
+                elif event.type == pygame.MOUSEWHEEL:
+                    scroll_by(-event.y * scroll_speed)
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button in (4, 5):
+                    scroll_by(-scroll_speed if event.button == 4 else scroll_speed)
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     adjusted_mouse_pos = event.pos
                     for rect, pokemon in self.selected_pokemon_rects:
@@ -379,10 +496,10 @@ class Game:
                                 delay_return = True
                             break
                 elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_DOWN and scroll_y < 0:
-                        scroll_y += scroll_speed
-                    elif event.key == pygame.K_UP and scroll_y > -(max_scroll_y - 550):
-                        scroll_y -= scroll_speed
+                    if event.key == pygame.K_DOWN:
+                        scroll_by(scroll_speed)
+                    elif event.key == pygame.K_UP:
+                        scroll_by(-scroll_speed)
                 if delay_return:
                     self.screen.fill((0, 0, 0))
                     prompt = f"Select Pokémon {len(selected_pokemons) + 1} of {self.battle_size}:"
@@ -396,12 +513,11 @@ class Game:
                         if image is None:
                             print(f"Missing image for: {name}")
                         if image:
-                            rect = self.display_pokemon_with_image(image, name, x, y + scroll_y, pokemon)
+                            rect = self.display_pokemon_with_image(image, name, x, y - scroll_offset, pokemon)
                             if pokemon['Name'] in [p['Name'] for p in selected_pokemons]:
                                 pygame.draw.rect(self.screen, (0, 255, 0), rect, 2)
                             elif rect.collidepoint(mouse_pos):
                                 pygame.draw.rect(self.screen, (255, 255, 0), rect, 2)
-                            self.selected_pokemon_rects.append((rect, pokemon))
                             x += padding
                             if x > self.screen_width - 100:
                                 x = 50
@@ -497,7 +613,7 @@ class Game:
                     y_offset += box_height + spacing
                 else:
                     x_offset += box_width + spacing
-            for event in pygame.event.get():
+            for event in self.get_events():
                 if event.type == pygame.QUIT:
                     self.quit_game()
                 elif event.type == pygame.KEYDOWN:
@@ -530,7 +646,7 @@ class Game:
             rendered_line = ""
             y = start_y + i * line_height
             for char in full_line:
-                for event in pygame.event.get():
+                for event in self.get_events():
                     if event.type == pygame.QUIT:
                         self.quit_game()
                 rendered_line += char
@@ -546,14 +662,14 @@ class Game:
             line_wait = 500
             start_time = pygame.time.get_ticks()
             while pygame.time.get_ticks() - start_time < line_wait:
-                for event in pygame.event.get():
+                for event in self.get_events():
                     if event.type == pygame.QUIT:
                         self.quit_game()
                 clock.tick(60)
         fade_surface = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
         fade_surface.fill((0, 0, 0))
         for alpha in range(0, 256, 10):
-            for event in pygame.event.get():
+            for event in self.get_events():
                 if event.type == pygame.QUIT:
                     self.quit_game()
             fade_surface.set_alpha(alpha)
@@ -568,12 +684,7 @@ class Game:
         if not hasattr(self, 'max_hp_tracker'):
             self.max_hp_tracker = {}
         def get_hp_info(pokemon):
-            unique_id = id(pokemon)
-            if unique_id not in self.max_hp_tracker:
-                self.max_hp_tracker[unique_id] = pokemon.hp
-            max_hp = self.max_hp_tracker[unique_id]
-            current_hp = max(0, pokemon.hp)
-            return current_hp / max_hp if max_hp else 0
+            return pokemon.hp / pokemon.max_hp if pokemon.max_hp else 0
         lines = [
             f"Turn {turn}",
             f"({', '.join(pokemon1.types)}) {pokemon1.name}'s HP: {pokemon1.hp}",
@@ -610,8 +721,8 @@ class Game:
         poke2_x = int(self.screen.get_width() * 0.62)
         poke2_y = int(self.screen.get_height() * 0.18)
         bg = pygame.transform.scale(self.background_image, (self.screen.get_width(), 360))
-        poke1_img = pygame.transform.scale(self.pokemon_images[pokemon1.name], (poke_size, poke_size))
-        poke2_img = pygame.transform.scale(self.pokemon_images[pokemon2.name], (poke_size, poke_size))
+        poke1_img = pygame.transform.scale(self.get_pokemon_image(pokemon1), (poke_size, poke_size))
+        poke2_img = pygame.transform.scale(self.get_pokemon_image(pokemon2), (poke_size, poke_size))
         if not hasattr(self, 'prev_pokemon1'):
             self.prev_pokemon1 = None
         if not hasattr(self, 'prev_pokemon2'):
@@ -671,7 +782,7 @@ class Game:
                 fading = False
                 self.prev_pokemon1 = pokemon1.name
                 self.prev_pokemon2 = pokemon2.name
-            for event in pygame.event.get():
+            for event in self.get_events():
                 if event.type == pygame.QUIT:
                     self.quit_game()
             clock.tick(60)
@@ -688,7 +799,7 @@ class Game:
         if delay > 0:
             start_time = pygame.time.get_ticks()
             while pygame.time.get_ticks() - start_time < delay * 1000:
-                for event in pygame.event.get():
+                for event in self.get_events():
                     if event.type == pygame.QUIT:
                         self.quit_game()
                 pygame.time.wait(10)
@@ -722,12 +833,17 @@ class Game:
         pygame.display.update(bottom_rect)
 
     def get_button_click(self, event):
-        if event.type == pygame.MOUSEBUTTONDOWN:
+        if self.is_primary_mouse_down(event):
             mouse_pos = pygame.mouse.get_pos()
             for rect, label in self.bottom_buttons:
                 if label and rect.collidepoint(mouse_pos):
                     return label
         return None
+
+    @staticmethod
+    def is_primary_mouse_down(event):
+        return (event.type == pygame.MOUSEBUTTONDOWN
+                and getattr(event, "button", 1) not in (4, 5))
 
     def process_move_hitted_animations(self, player1, player2):
         if not hasattr(self, 'move_hitted_stack') or len(self.move_hitted_stack) == 0:
@@ -769,8 +885,8 @@ class Game:
             beam_color = type_colors.get(move_type, (200, 200, 200))
             attacker_pos = (int(screen_width * 0.14), int(screen_height * 0.3)) if player1.current_pokemon == attacker else (int(screen_width * 0.62), int(screen_height * 0.18))
             target_pos = (int(screen_width * 0.62), int(screen_height * 0.18)) if player1.current_pokemon == attacker else (int(screen_width * 0.14), int(screen_height * 0.3))
-            attacker_img = pygame.transform.scale(self.pokemon_images[attacker.name], (poke_size, poke_size))
-            target_img = pygame.transform.scale(self.pokemon_images[target.name], (poke_size, poke_size))
+            attacker_img = pygame.transform.scale(self.get_pokemon_image(attacker), (poke_size, poke_size))
+            target_img = pygame.transform.scale(self.get_pokemon_image(target), (poke_size, poke_size))
             for _ in range(3):
                 steps = 15
                 for i in range(steps):
@@ -816,7 +932,7 @@ class Game:
                 pygame.time.delay(300)
                 for _ in range(2):
                     for scale in [1.1, 0.9]:
-                        temp_img = pygame.transform.scale(self.pokemon_images[target.name], (int(poke_size * scale), int(poke_size * scale)))
+                        temp_img = pygame.transform.scale(self.get_pokemon_image(target), (int(poke_size * scale), int(poke_size * scale)))
                         pos = (
                             target_pos[0] + (poke_size - temp_img.get_width()) // 2,
                             target_pos[1] + (poke_size - temp_img.get_height()) // 2
@@ -841,9 +957,15 @@ class Game:
 
     def handle_fight_command(self, player, computer=0):
         moves = player.current_pokemon.moves
+        valid_moves = self.usable_move_indices(player.current_pokemon)
         if computer != 0:
-            valid_moves = list(range(len(moves)))
-            return ('fight', player.current_pokemon, random.choice(valid_moves))
+            if valid_moves:
+                return ('fight', player.current_pokemon, random.choice(valid_moves))
+            bench = [index for index, pokemon in enumerate(player.pokemons)
+                     if pokemon.hp > 0 and index != player.current_pokemon_index]
+            return ('switch', player.current_pokemon_index, random.choice(bench)) if bench else []
+        if not valid_moves:
+            return None
         font = pygame.font.SysFont("DejaVu Sans", 28)
         self.scroll_offset = 0
         line_height = 50
@@ -869,14 +991,16 @@ class Game:
                 y = y_start + i * line_height
                 if 460 <= y <= 460 + visible_height:
                     button_rect = pygame.Rect(60, y, 400, line_height - 5)
-                    pygame.draw.rect(self.screen, type_colors.get(move.type, (70, 130, 180)), button_rect)
+                    color = type_colors.get(move.type, (70, 130, 180)) if move.pp > 0 else (90, 90, 90)
+                    pygame.draw.rect(self.screen, color, button_rect)
                     pygame.draw.rect(self.screen, (255, 255, 255), button_rect, 2)
                     bg_color = type_colors.get(move.type, (70, 130, 180))
                     brightness = sum(bg_color) / 3
                     text_color = (0, 0, 0) if brightness > 150 else (255, 255, 255)
                     text_surface = font.render(f"{move.name}: ({move.type}) ({move.pp}/{move.max_pp})", True, text_color)
                     self.screen.blit(text_surface, (button_rect.x + 10, button_rect.y + 10))
-                    button_rects.append((button_rect, move))
+                    if move.pp > 0:
+                        button_rects.append((button_rect, move))
             pygame.draw.rect(self.screen, (180, 50, 50), back_button, border_radius=8)
             pygame.draw.rect(self.screen, (255, 255, 255), back_button, 2)
             back_text = font.render("Back", True, (255, 255, 255))
@@ -884,8 +1008,9 @@ class Game:
             pygame.display.update(bottom_rect)
         draw_moves()
         selected_move = None
+        clock = pygame.time.Clock()
         while selected_move is None:
-            for event in pygame.event.get():
+            for event in self.get_events():
                 if event.type == pygame.QUIT:
                     self.quit_game()
                 elif event.type == pygame.KEYDOWN:
@@ -897,9 +1022,9 @@ class Game:
                         draw_moves()
                     elif event.unicode.isdigit():
                         index = int(event.unicode) - 1
-                        if 0 <= index < len(moves):
-                            selected_move = moves[index]
-                elif event.type == pygame.MOUSEBUTTONDOWN:
+                        if index in valid_moves:
+                            selected_move = index
+                elif self.is_primary_mouse_down(event):
                     mx, my = event.pos
                     if back_button.collidepoint(mx, my):
                         bottom_rect = pygame.Rect(0, 460, self.screen.get_width(), visible_height)
@@ -910,6 +1035,7 @@ class Game:
                         if rect.collidepoint(mx, my):
                             selected_move = moves.index(move)
                             break
+            clock.tick(30)
         if selected_move is not None:
             bottom_rect = pygame.Rect(0, 460, self.screen.get_width(), visible_height)
             pygame.draw.rect(self.screen, (0, 0, 0), bottom_rect)
@@ -928,6 +1054,12 @@ class Game:
             else:
                 clickable[p.name] = i
             all_pokemon.append(label)
+        if not clickable and not fainted:
+            self.battle_message = "There are no Pokémon available to switch to."
+            self.draw_battle_message(1.3)
+            self.battle_message = ""
+            self.draw_battle_message(0)
+            return None
         if fainted:
             available = [i for i, p in enumerate(player.pokemons)
                         if p.hp > 0 and i != player.current_pokemon_index]
@@ -968,8 +1100,9 @@ class Game:
             pygame.display.update(bottom_rect)
         draw_pokemon_list()
         selected = None
+        clock = pygame.time.Clock()
         while selected is None:
-            for event in pygame.event.get():
+            for event in self.get_events():
                 if event.type == pygame.QUIT:
                     self.quit_game()
                 elif event.type == pygame.KEYDOWN:
@@ -979,7 +1112,7 @@ class Game:
                     elif event.key == pygame.K_UP:
                         self.scroll_offset = max(self.scroll_offset - line_height, 0)
                         draw_pokemon_list()
-                elif event.type == pygame.MOUSEBUTTONDOWN:
+                elif self.is_primary_mouse_down(event):
                     mx, my = event.pos
                     if not fainted and back_button.collidepoint(mx, my):
                         bottom_rect = pygame.Rect(0, 460, self.screen.get_width(), visible_height)
@@ -990,6 +1123,7 @@ class Game:
                         if name and rect.collidepoint(mx, my):
                             selected = clickable.get(name)
                             break
+            clock.tick(30)
         if selected is not None:
             bottom_rect = pygame.Rect(0, 460, self.screen.get_width(), visible_height)
             pygame.draw.rect(self.screen, (0, 0, 0), bottom_rect)
@@ -1026,11 +1160,12 @@ class Game:
         draw_list()
         pygame.display.flip()
         start_time = pygame.time.get_ticks()
+        clock = pygame.time.Clock()
         while True:
             now = pygame.time.get_ticks()
             if now - start_time > 5000:
                 break
-            for event in pygame.event.get():
+            for event in self.get_events():
                 if event.type == pygame.QUIT:
                     self.quit_game()
                 if event.type == pygame.KEYDOWN:
@@ -1042,49 +1177,33 @@ class Game:
                     elif event.key == pygame.K_UP:
                         scroll_offset = max(scroll_offset - line_height, 0)
                         draw_list()
+            clock.tick(30)
 
     def generate_random_moves(self, learnable_moves):
-        physical_moves = []
-        special_moves = []
-        for m in self.moves:
-            if m['Name'] in learnable_moves:
-                if m['Category'] == 'Physical' and m['Power'] != 'None': 
-                    physical_moves.append(m)
-                elif m['Category'] == 'Special' and m['Power'] != 'None':
-                    special_moves.append(m)
-        if len(physical_moves) > ((self.move_size + 1)//2):
-            random_physical_moves = random.sample(physical_moves, ((self.move_size + 1)//2))
-        else:
-            random_physical_moves = physical_moves
-        if len(special_moves) > (self.move_size - len(random_physical_moves)):
-            random_special_moves = random.sample(special_moves, self.move_size - len(random_physical_moves))
-        else:
-            random_special_moves = special_moves
-        move_list = random_physical_moves + random_special_moves
-        if len(move_list) < self.move_size:
-            num_moves_to_select = min((self.move_size-len(move_list)), len(learnable_moves))
-            available_moves = [move for move in set(learnable_moves) if move not in move_list]
-            move_l = random.sample(available_moves,num_moves_to_select)
-            for m in self.moves:
-                if m['Name'] in move_l:
-                    move_list.append(m)
-        name_counts = Counter(m['Name'] for m in move_list)
-        output = []
-        for m in move_list:
-            if name_counts[m['Name']] == 1:
-                output.append(Move(m))
-        if len(output) < self.move_size:
-            existing_names = {m.name for m in output}
-            additional_moves = [m for m in self.moves if m['Name'] in learnable_moves and m['Name'] not in existing_names]
-            for m in additional_moves:
-                output.append(Move(m))
-                existing_names.add(m['Name'])
-                if len(output) == self.move_size:
-                    break
-        return output
+        distinct_status_moves = set(
+            self.heal_user_moves + self.heal_target_moves + self.drain_moves + ['Transform', 'Sketch']
+        )
+        learnable_names = set(learnable_moves)
+        eligible = [move for move in self.moves
+                    if move['Name'] in learnable_names
+                    and not (move['Category'] == 'Status'
+                             and move['Power'] == 'None'
+                             and move['Name'] not in distinct_status_moves)]
+        physical = [move for move in eligible if move['Category'] == 'Physical' and move['Power'] != 'None']
+        special = [move for move in eligible if move['Category'] == 'Special' and move['Power'] != 'None']
+        selected = random.sample(physical, min(len(physical), (self.move_size + 1) // 2))
+        selected += random.sample(special, min(len(special), self.move_size - len(selected)))
+        selected_names = {move['Name'] for move in selected}
+        remaining = [move for move in eligible if move['Name'] not in selected_names]
+        if len(selected) < self.move_size:
+            selected += random.sample(remaining, min(len(remaining), self.move_size - len(selected)))
+        return [Move(move) for move in selected]
 
     def fight(self, move, pokemon1, pokemon2,player,r_check):
+        if getattr(move, 'pp', 1) <= 0:
+            return
         self.move_log_stack.append(f"{pokemon1.name} used {move.name}")
+        pokemon2.last_opponent_move_seen = copy(move)
         self.battle_message = f"{pokemon1.name} used {move.name}"
         self.draw_battle_message(1.3)
         self.battle_message = ""
@@ -1097,7 +1216,13 @@ class Game:
                 damage_dealt = self.damage.calculate_damage(move, pokemon1, pokemon2)
             else:
                 damage_dealt = [0,0]
-        if damage_dealt[0] == 0 and move.name not in self.heal_user_moves and move.name not in self.heal_target_moves and move.name != 'Transform' and move.name != 'Sketch':
+        if move.name == 'Transform':
+            self.apply_transform(pokemon1, pokemon2)
+        elif move.name == 'Sketch':
+            self.apply_sketch(pokemon1)
+        if (damage_dealt[0] == 0 and move.name not in self.heal_user_moves
+                and move.name not in self.heal_target_moves
+                and move.name not in ('Transform', 'Sketch')):
             self.battle_message = f"{pokemon2.name} avoided the attack..."
             self.draw_battle_message(1.3)
             self.battle_message = ""
@@ -1112,21 +1237,21 @@ class Game:
             self.draw_battle_message(0)
         move.update_pp(-1)
         if (move.name in self.heal_user_moves):
-            pokemon1.update_hp(+50)
-            self.battle_message = f"{pokemon1.name} recovered its HP by 50..."  
+            recovered = pokemon1.update_hp(pokemon1.max_hp // 2)
+            self.battle_message = f"{pokemon1.name} recovered its HP by {recovered}..."
             self.draw_battle_message(1.3)    
             self.battle_message = ""
             self.draw_battle_message(0)  
         elif (move.name in self.heal_target_moves):
-            pokemon2.update_hp(+50)
-            self.battle_message = f"{pokemon2.name} recovered its HP by 50..."
+            recovered = pokemon2.update_hp(pokemon2.max_hp // 2)
+            self.battle_message = f"{pokemon2.name} recovered its HP by {recovered}..."
             self.draw_battle_message(1.3)
             self.battle_message = ""
             self.draw_battle_message(0)
         elif (move.name in self.drain_moves):
-            pokemon2.update_hp(-damage_dealt[0])
-            pokemon1.update_hp(+(damage_dealt[0] // 4))
-            self.battle_message = f"{pokemon1.name} recovered its HP by {damage_dealt[0] // 4}..." 
+            damage_removed = -pokemon2.update_hp(-damage_dealt[0])
+            recovered = pokemon1.update_hp(damage_removed)
+            self.battle_message = f"{pokemon1.name} recovered its HP by {recovered}..."
             self.draw_battle_message(1.3)   
             self.battle_message = ""
             self.draw_battle_message(0)    
@@ -1146,141 +1271,82 @@ class Game:
         self.draw_battle_message(0)
     
     def check_fainting(self, pokemon):
-        if pokemon.hp <= 0: 
+        if pokemon.hp <= 0:
+            pokemon.fainted = True
+            pokemon.revert_transformation()
             return True
         return False
 
-    def handle_fight_fight(self, player1, player2, move_index1, move_index2,arc1,arc2):
-        pokemon1 = player1.current_pokemon
-        pokemon2 = player2.current_pokemon
-        move1 = pokemon1.moves[move_index1]
-        move2 = pokemon2.moves[move_index2]
-        if pokemon1.speed > pokemon2.speed:
-            self.fight(move1, pokemon1, pokemon2,player1,arc1)
-            if self.check_fainting(pokemon1) and self.check_fainting(pokemon2):
-                self.fainted_pokemon.append(pokemon1.name)
-                self.fainted_pokemon.append(pokemon2.name)
-                player1.remaining_pokemons -= 1
-                player2.remaining_pokemons -= 1
-                return [player1.name, player2.name]
-            if self.check_fainting(pokemon1):
-                self.fainted_pokemon.append(pokemon1.name)
-                player1.remaining_pokemons -= 1
-                return [player1.name]
-            if self.check_fainting(pokemon2):
-                self.fainted_pokemon.append(pokemon2.name)
-                player2.remaining_pokemons -= 1
-                return [player2.name]
-            self.fight(move2, pokemon2, pokemon1,player2,arc2)
-            if self.check_fainting(pokemon2) and self.check_fainting(pokemon1):
-                self.fainted_pokemon.append(pokemon1.name)
-                self.fainted_pokemon.append(pokemon2.name)
-                player1.remaining_pokemons -= 1
-                player2.remaining_pokemons -= 1
-                return [player1.name, player2.name]
-            if self.check_fainting(pokemon1):
-                self.fainted_pokemon.append(pokemon1.name)
-                player1.remaining_pokemons -= 1
-                return [player1.name]
-            if self.check_fainting(pokemon2):
-                self.fainted_pokemon.append(pokemon2.name)
-                player2.remaining_pokemons -= 1
-                return [player2.name]
-        elif pokemon1.speed < pokemon2.speed:
-            self.fight(move2, pokemon2, pokemon1,player2,arc2)
-            if self.check_fainting(pokemon2) and self.check_fainting(pokemon1):
-                self.fainted_pokemon.append(pokemon2.name)
-                self.fainted_pokemon.append(pokemon1.name)
-                player1.remaining_pokemons -= 1
-                player2.remaining_pokemons -= 1
-                return [player1.name, player2.name]
-            if self.check_fainting(pokemon1):
-                self.fainted_pokemon.append(pokemon1.name)
-                player1.remaining_pokemons -= 1
-                return [player1.name]
-            if self.check_fainting(pokemon2):
-                self.fainted_pokemon.append(pokemon2.name)
-                player2.remaining_pokemons -= 1
-                return [player2.name]
-            self.fight(move1, pokemon1, pokemon2,player1,arc1)
-            if self.check_fainting(pokemon1) and self.check_fainting(pokemon2):
-                self.fainted_pokemon.append(pokemon1.name)
-                self.fainted_pokemon.append(pokemon2.name)
-                player1.remaining_pokemons -= 1
-                player2.remaining_pokemons -= 1
-                return [player1.name, player2.name]
-            if self.check_fainting(pokemon1):
-                self.fainted_pokemon.append(pokemon1.name)
-                player1.remaining_pokemons -= 1
-                return [player1.name]
-            if self.check_fainting(pokemon2):
-                self.fainted_pokemon.append(pokemon2.name)
-                player2.remaining_pokemons -= 1
-                return [player2.name]
-        else:
-            random_pokemon = random.randint(1, 2)
-            if random_pokemon == 1:
-                self.fight(move1, pokemon1, pokemon2,player1,arc1)
-                if self.check_fainting(pokemon1) and self.check_fainting(pokemon2):
-                    self.fainted_pokemon.append(pokemon1.name)
-                    self.fainted_pokemon.append(pokemon2.name)
-                    player1.remaining_pokemons -= 1
-                    player2.remaining_pokemons -= 1
-                    return [player1.name, player2.name]
-                if self.check_fainting(pokemon1):
-                    self.fainted_pokemon.append(pokemon1.name)
-                    player1.remaining_pokemons -= 1
-                    return [player1.name]
-                if self.check_fainting(pokemon2):
-                    self.fainted_pokemon.append(pokemon2.name)
-                    player2.remaining_pokemons -= 1
-                    return [player2.name]
-                self.fight(move2, pokemon2, pokemon1,player2,arc2)
-                if self.check_fainting(pokemon2) and self.check_fainting(pokemon1):
-                    self.fainted_pokemon.append(pokemon2.name)
-                    self.fainted_pokemon.append(pokemon1.name) 
-                    player1.remaining_pokemons -= 1
-                    player2.remaining_pokemons -= 1
-                    return [player1.name, player2.name]
-                if self.check_fainting(pokemon1):
-                    self.fainted_pokemon.append(pokemon1.name)
-                    player1.remaining_pokemons -= 1
-                    return [player1.name]
-                if self.check_fainting(pokemon2):
-                    self.fainted_pokemon.append(pokemon2.name)
-                    player2.remaining_pokemons -= 1
-                    return [player2.name]
-            else:
-                self.fight(move2, pokemon2, pokemon1,player2,arc2)
-                if self.check_fainting(pokemon2) and self.check_fainting(pokemon1):
-                    self.fainted_pokemon.append(pokemon2.name)
-                    self.fainted_pokemon.append(pokemon1.name)
-                    player1.remaining_pokemons -= 1
-                    player2.remaining_pokemons -= 1
-                    return [player1.name, player2.name]
-                if self.check_fainting(pokemon1):
-                    self.fainted_pokemon.append(pokemon1.name)
-                    player1.remaining_pokemons -= 1
-                    return [player1.name]
-                if self.check_fainting(pokemon2):
-                    self.fainted_pokemon.append(pokemon2.name)
-                    player2.remaining_pokemons -= 1
-                    return [player2.name]
-                self.fight(move1, pokemon1, pokemon2,player1,arc1)
-                if self.check_fainting(pokemon1) and self.check_fainting(pokemon2):
-                    self.fainted_pokemon.append(pokemon1.name)
-                    self.fainted_pokemon.append(pokemon2.name)
-                    player1.remaining_pokemons -= 1
-                    player2.remaining_pokemons -= 1
-                    return [player1.name, player2.name]
-                if self.check_fainting(pokemon1):
-                    self.fainted_pokemon.append(pokemon1.name)
-                    player1.remaining_pokemons -= 1
-                    return [player1.name]
-                if self.check_fainting(pokemon2):
-                    self.fainted_pokemon.append(pokemon2.name)
-                    player2.remaining_pokemons -= 1
-                    return [player2.name]
+    @staticmethod
+    def usable_move_indices(pokemon):
+        return [index for index, move in enumerate(pokemon.moves) if move.pp > 0]
+
+    def valid_commands(self, player):
+        commands = ['fight'] if self.usable_move_indices(player.current_pokemon) else []
+        commands.append('switch')
+        commands.extend(('list', 'exit'))
+        return commands
+
+    def get_pokemon_image(self, pokemon):
+        return pokemon.transformed_image or self.pokemon_images[pokemon.name]
+
+    def apply_transform(self, pokemon, opponent):
+        pokemon.transform_into(opponent.moves)
+        pokemon.transformed_image = self.get_pokemon_image(opponent)
+
+    def apply_sketch(self, pokemon):
+        observed_move = pokemon.last_opponent_move_seen
+        if observed_move is None:
+            self.battle_message = "There is nothing to sketch."
+            self.draw_battle_message(1.3)
+            self.battle_message = ""
+            self.draw_battle_message(0)
+            return False
+
+        sketch_index = next((index for index, move in enumerate(pokemon.moves)
+                             if move.name.lower() == 'sketch'), None)
+        if sketch_index is None:
+            return False
+        copied_move = copy(observed_move)
+        copied_move.pp = copied_move.max_pp
+        pokemon.moves[sketch_index] = copied_move
+        self.battle_message = f"{pokemon.name} learned {copied_move.name}!"
+        self.draw_battle_message(1.3)
+        self.battle_message = ""
+        self.draw_battle_message(0)
+        return True
+
+    def _record_fainted_players(self, *players):
+        fainted_names = []
+        for player in players:
+            pokemon = player.current_pokemon
+            if self.check_fainting(pokemon) and not pokemon.faint_recorded:
+                pokemon.faint_recorded = True
+                player.remaining_pokemons = max(0, player.remaining_pokemons - 1)
+                self.fainted_pokemon.append(pokemon.name)
+                fainted_names.append(player.name)
+        return fainted_names
+
+    def _resolve_fight_actions(self, ordered_actions):
+        for attacker, defender, move_index, accuracy in ordered_actions:
+            if attacker.current_pokemon.hp <= 0 or defender.current_pokemon.hp <= 0:
+                break
+            move = attacker.current_pokemon.moves[move_index]
+            self.fight(move, attacker.current_pokemon, defender.current_pokemon, attacker, accuracy)
+            fainted = self._record_fainted_players(attacker, defender)
+            if fainted:
+                return fainted
+        return []
+
+    def handle_fight_fight(self, player1, player2, move_index1, move_index2, arc1, arc2):
+        first, second = (player1, player2) if player1.current_pokemon.speed > player2.current_pokemon.speed else (player2, player1)
+        if player1.current_pokemon.speed == player2.current_pokemon.speed:
+            first, second = random.choice(((player1, player2), (player2, player1)))
+        indices = {player1: (move_index1, arc1), player2: (move_index2, arc2)}
+        return self._resolve_fight_actions([
+            (first, second, *indices[first]),
+            (second, first, *indices[second]),
+        ])
 
     def handle_switch_switch(self, player1, switched_pokemon1, player2, switched_pokemon2):
         self.switch(player1, switched_pokemon1)
@@ -1301,126 +1367,33 @@ class Game:
             pygame.display.update()
 
     def handle_rest_fight(self, player1, action1, player2, action2, arc1, arc2):
-        print(f"[DEBUG] Entered handle_rest_fight()")
-        print(f"[DEBUG] action1: {action1}, action2: {action2}")
-        if len(action1) < 1:
-            print("[DEBUG] Player1 is resting. Player2 is attacking.")
-            move2 = player2.current_pokemon.moves[action2[2]]
-            print(f"[DEBUG] Player2's move: {move2.name} (Accuracy: {arc2})")
-            self.fight(move2, player2.current_pokemon, player1.current_pokemon, player2, arc2)
-            if action2[1].moves[action2[2]].name == 'Transform':
-                print("[DEBUG] Player2 used Transform.")
-                self.player2.current_pokemon.moves = self.player2.opponent.current_pokemon.moves
-                self.pokemon_images[self.player2.current_pokemon.name] = self.pokemon_images[self.player2.opponent.current_pokemon.name]
-            faint1 = self.check_fainting(player1.current_pokemon)
-            faint2 = self.check_fainting(player2.current_pokemon)
-            print(f"[DEBUG] Faint check: player1={faint1}, player2={faint2}")
-            if faint1 and faint2:
-                print("[DEBUG] Both Pokémon fainted.")
-                self.fainted_pokemon.append(player2.current_pokemon.name)
-                self.fainted_pokemon.append(player1.current_pokemon.name)
-                player1.remaining_pokemons -= 1
-                player2.remaining_pokemons -= 1
-                return [player1.name, player2.name]
-            if faint1:
-                print(f"[DEBUG] {player1.current_pokemon.name} fainted.")
-                self.fainted_pokemon.append(player1.current_pokemon.name)
-                player1.remaining_pokemons -= 1
-                return [player1.name]
-            if faint2:
-                print(f"[DEBUG] {player2.current_pokemon.name} fainted.")
-                self.fainted_pokemon.append(player2.current_pokemon.name)
-                player2.remaining_pokemons -= 1
-                return [player2.name]
-        elif len(action2) < 1:
-            print("[DEBUG] Player2 is resting. Player1 is attacking.")
-            move1 = player1.current_pokemon.moves[action1[2]]
-            print(f"[DEBUG] Player1's move: {move1.name} (Accuracy: {arc1})")
-            self.fight(move1, player1.current_pokemon, player2.current_pokemon, player1, arc1)
-            if action1[1].moves[action1[2]].name == 'Transform':
-                print("[DEBUG] Player1 used Transform.")
-                self.player1.current_pokemon.moves = self.player1.opponent.current_pokemon.moves
-                self.pokemon_images[self.player1.current_pokemon.name] = self.pokemon_images[self.player1.opponent.current_pokemon.name]
-            faint1 = self.check_fainting(player1.current_pokemon)
-            faint2 = self.check_fainting(player2.current_pokemon)
-            print(f"[DEBUG] Faint check: player1={faint1}, player2={faint2}")
-            if faint1 and faint2:
-                print("[DEBUG] Both Pokémon fainted.")
-                self.fainted_pokemon.append(player1.current_pokemon.name)
-                self.fainted_pokemon.append(player2.current_pokemon.name)
-                player1.remaining_pokemons -= 1
-                player2.remaining_pokemons -= 1
-                return [player1.name, player2.name]
-            if faint1:
-                print(f"[DEBUG] {player1.current_pokemon.name} fainted.")
-                self.fainted_pokemon.append(player1.current_pokemon.name)
-                player1.remaining_pokemons -= 1
-                return [player1.name]
-            if faint2:
-                print(f"[DEBUG] {player2.current_pokemon.name} fainted.")
-                self.fainted_pokemon.append(player2.current_pokemon.name)
-                player2.remaining_pokemons -= 1
-                return [player2.name]
-        print("[DEBUG] Exiting handle_rest_fight() with no fainting.")
+        if not action1 and action2 and action2[0] == 'fight':
+            return self._resolve_fight_actions([(player2, player1, action2[2], arc2)])
+        if not action2 and action1 and action1[0] == 'fight':
+            return self._resolve_fight_actions([(player1, player2, action1[2], arc1)])
+        return []
 
-    
-    def handle_switch_fight(self, player1, action1, player2, action2,arc1,arc2):
-        if action1[0] == 'switch':
+    def handle_switch_fight(self, player1, action1, player2, action2, arc1, arc2):
+        if action1 and action1[0] == 'switch':
             self.switch(player1, action1[2])
-            self.draw_middle_area(self.player1.current_pokemon, self.player2.current_pokemon)
-            pygame.display.update()
-            move2 = player2.current_pokemon.moves[action2[2]]
-            self.fight(move2, player2.current_pokemon, player1.current_pokemon,player2,arc2)
-            if action2[1].moves[action2[2]].name == 'Transform':
-                self.player2.current_pokemon.moves=self.player2.opponent.current_pokemon.moves
-                self.pokemon_images[self.player2.current_pokemon.name] = self.pokemon_images[self.player2.opponent.current_pokemon.name]
-            if self.check_fainting(player2.current_pokemon) and self.check_fainting(player1.current_pokemon):
-                self.fainted_pokemon.append(player2.current_pokemon.name)
-                self.fainted_pokemon.append(player1.current_pokemon.name)
-                player1.remaining_pokemons -= 1
-                player2.remaining_pokemons -= 1
-                return [player1.name, player2.name]
-            if self.check_fainting(player1.current_pokemon):
-                self.fainted_pokemon.append(player1.current_pokemon.name)
-                player1.remaining_pokemons -= 1
-                return [player1.name]
-            if self.check_fainting(player2.current_pokemon):
-                self.fainted_pokemon.append(player2.current_pokemon.name)
-                player2.remaining_pokemons -= 1
-                return [player2.name]
-        elif action2[0] == 'switch':
+            attacker, defender, accuracy, move_index = player2, player1, arc2, action2[2]
+        else:
             self.switch(player2, action2[2])
-            self.draw_middle_area(self.player1.current_pokemon, self.player2.current_pokemon)
-            pygame.display.update()
-            move1 = player1.current_pokemon.moves[action1[2]]
-            self.fight(move1, player1.current_pokemon, player2.current_pokemon,player1,arc1)
-            if action1[1].moves[action1[2]].name == 'Transform':
-                self.player1.current_pokemon.moves=self.player1.opponent.current_pokemon.moves
-                self.pokemon_images[self.player1.current_pokemon.name] = self.pokemon_images[self.player1.opponent.current_pokemon.name]
-            if self.check_fainting(player1.current_pokemon) and self.check_fainting(player2.current_pokemon):
-                self.fainted_pokemon.append(player1.current_pokemon.name)
-                self.fainted_pokemon.append(player2.current_pokemon.name)
-                player1.remaining_pokemons -= 1
-                player2.remaining_pokemons -= 1
-                return [player1.name, player2.name]
-            if self.check_fainting(player1.current_pokemon):
-                self.fainted_pokemon.append(player1.current_pokemon.name)
-                player1.remaining_pokemons -= 1
-                return [player1.name]
-            if self.check_fainting(player2.current_pokemon):
-                self.fainted_pokemon.append(player2.current_pokemon.name)
-                player2.remaining_pokemons -= 1
-                return [player2.name]
+            attacker, defender, accuracy, move_index = player1, player2, arc1, action1[2]
+        self.draw_middle_area(self.player1.current_pokemon, self.player2.current_pokemon)
+        pygame.display.update()
+        return self._resolve_fight_actions([(attacker, defender, move_index, accuracy)])
 
     def prompt_player_command(self, player, valid_commands):
         command = None
+        clock = pygame.time.Clock()
         while command not in valid_commands:
             self.battle_message = f"{player.name}'s Move"
             self.draw_battle_message(0)
             self.draw_bottom_buttons(valid_commands)
             waiting = True
             while waiting:
-                for event in pygame.event.get():
+                for event in self.get_events():
                     if event.type == pygame.QUIT:
                         self.quit_game()
                     action = self.get_button_click(event)
@@ -1429,6 +1402,7 @@ class Game:
                         self.battle_message = f"{player.name} chose: {command}"
                         self.draw_battle_message(0)
                         waiting = False
+                clock.tick(30)
         return command
  
     def get_player_by_name(self, name):
@@ -1445,6 +1419,7 @@ class Game:
         self.arc1_copy = None
         self.arc2_copy = None
         player_to_switch = []
+        turn_clock = pygame.time.Clock()
         while not self.gameOver:
             PreparedFlag1 = False
             PreparedFlag2 = False
@@ -1453,7 +1428,7 @@ class Game:
             arc1 = None
             arc2 = None
             self.screen.fill((0, 0, 0))
-            valid_commands = ['fight', 'switch', 'list', 'exit']
+            valid_commands = self.valid_commands(self.player1)
             print("[DEBUG] Drawing battle UI elements.")
             self.draw_top_info(turn, self.player1.current_pokemon, self.player2.current_pokemon)
             self.draw_middle_area(self.player1.current_pokemon, self.player2.current_pokemon)
@@ -1484,7 +1459,7 @@ class Game:
                 self.draw_battle_message(0)
                 print(f"[DEBUG] {self.battle_message}")
                 while waiting:
-                    for event in pygame.event.get():
+                    for event in self.get_events():
                         if event.type == pygame.QUIT:
                             print("[DEBUG] Quit event detected. Exiting game.")
                             self.quit_game()
@@ -1496,6 +1471,7 @@ class Game:
                             self.draw_battle_message(0)
                             print(f"[DEBUG] {self.battle_message}")
                             waiting = False
+                    turn_clock.tick(30)
                 if command == 'fight':
                     print("[DEBUG] Handling fight command for Player1.")
                     result = self.handle_fight_command(self.player1)
@@ -1522,33 +1498,11 @@ class Game:
                     self.battle_message = "Bye..."
                     self.draw_battle_message(0.5)
                     print(f"[DEBUG] {self.battle_message}")
-                    self.gameOver = True
+                    if self.game_mode == "2":
+                        self.finish_forfeit(self.player1)
+                    else:
+                        self.gameOver = True
                     break
-                if(action1 and action1[1] is not None and not isinstance(action1[1], int)):
-                    print(f"[DEBUG] Storing last_move_used: {action1[1].moves[action1[2]].name}")
-                    self.player1.current_pokemon.last_move_used = action1[1].moves[action1[2]].name
-                if self.player1.current_pokemon.last_move_used == 'Sketch':
-                    print("[DEBUG] Player1 used Sketch. Searching for opponent’s last move.")
-                    for i in range(len(self.move_log_stack) - 1, -1, -1):
-                        entry = self.move_log_stack[i]
-                        if entry.startswith(f"{self.player1.current_pokemon.name} used Sketch"):
-                            if i > 0:
-                                prev_entry = self.move_log_stack[i - 1]
-                                if prev_entry.startswith(f"{self.player2.current_pokemon.name} used "):
-                                    move_name = prev_entry.split(" used ")[1].strip()
-                                    print(f"[DEBUG] Sketch will copy move: {move_name}")
-                                    for j, n in enumerate(self.player2.current_pokemon.moves):
-                                        if n.name.lower() == move_name.lower():
-                                            for k, m in enumerate(self.player1.current_pokemon.moves):
-                                                if m.name.lower() == 'sketch':
-                                                    self.player1.current_pokemon.moves[k] = self.player2.current_pokemon.moves[j]
-                                                    self.battle_message = f"{self.player1.current_pokemon.name} learned {move_name}!"
-                                                    self.draw_battle_message(1.3)
-                                                    print(f"[DEBUG] {self.battle_message}")
-                                                    self.battle_message = ""
-                                                    self.draw_battle_message(0)
-                                                    break
-                            break
                 if (action1 and action1[1] is not None and not isinstance(action1[1], int)
                     and self.player1.current_pokemon.name == action1[1].name
                     and action1[1].moves[action1[2]].name in self.prepared_moves):
@@ -1591,7 +1545,7 @@ class Game:
                 elif self.game_mode == "2":
                     print("[DEBUG] Game mode 2: Player2 choosing manually.")
                     while True:
-                        command = self.prompt_player_command(self.player2, valid_commands)
+                        command = self.prompt_player_command(self.player2, self.valid_commands(self.player2))
                         print(f"[DEBUG] Player2 entered command: {command}")
                         if command == 'list':
                             print("[DEBUG] Listing Player2 Pokémon.")
@@ -1621,8 +1575,10 @@ class Game:
                             self.battle_message = "Bye..."
                             self.draw_battle_message(0.5)
                             print(f"[DEBUG] {self.battle_message}")
-                            self.gameOver = True
+                            self.finish_forfeit(self.player2)
                             break
+            if self.gameOver:
+                break
             if self.game_mode == "3":
                 print("[DEBUG] Entered game_mode 3 block.")
                 effective_action1 = self.action1_copy if self.action1_copy else action1
@@ -1651,52 +1607,9 @@ class Game:
                     if not PreparedFlag1:
                         print("[DEBUG] Sending my move now...")
                         self.send_player_move(effective_action1, effective_arc1)
-                if (action2 and len(action2) > 1 and action2[1] and not isinstance(action2[1], int)
-                    and effective_action1 and len(effective_action1) > 1 and effective_action1[1] and not isinstance(effective_action1[1], int)):
-                    print("[DEBUG] Both moves are fight-type and not switching. Checking speed tie...")
-                    if effective_action1[1].speed == action2[1].speed:
-                        print("[DEBUG] Speed tie detected.")
-                        if self.settings['is_host']:
-                            print("[DEBUG] Host wins speed tie. Buffing host speed.")
-                            for p in self.player1.pokemons:
-                                if p.name == effective_action1[1].name:
-                                    p.speed += 10
-                                    print(f"[DEBUG] Boosted speed of {p.name} to {p.speed}")
-                                    break
-                        else:
-                            print("[DEBUG] Host wins speed tie. Buffing host speed.")
-                            for p in self.player2.pokemons:
-                                if p.name == effective_action1[1].name:
-                                    p.speed += 10
-                                    print(f"[DEBUG] Boosted speed of {p.name} to {p.speed}")
-                                    break
-                if(action2 and len(action2) > 1 and action2[1] is not None and not isinstance(action2[1], int)):
-                    print(f"[DEBUG] Storing last_move_used for Player2: {action2[1].moves[action2[2]].name}")
-                    self.player2.current_pokemon.last_move_used = action2[1].moves[action2[2]].name
-                if self.player2.current_pokemon.last_move_used == 'Sketch':
-                    print("[DEBUG] Player2 used Sketch. Attempting to learn last move from Player1...")
-                    for i in range(len(self.move_log_stack) - 1, -1, -1):
-                        entry = self.move_log_stack[i]
-                        if entry.startswith(f"{self.player2.current_pokemon.name} used Sketch"):
-                            if i > 0:
-                                prev_entry = self.move_log_stack[i - 1]
-                                print(f"[DEBUG] Previous move found: {prev_entry}")
-                                if prev_entry.startswith(f"{self.player1.current_pokemon.name} used "):
-                                    move_name = prev_entry.split(" used ")[1].strip()
-                                    print(f"[DEBUG] Player2 attempting to learn move: {move_name}")
-                                    for j, n in enumerate(self.player1.current_pokemon.moves):
-                                        if n.name.lower() == move_name.lower():
-                                            for k, m in enumerate(self.player2.current_pokemon.moves):
-                                                if m.name.lower() == 'sketch':
-                                                    print(f"[DEBUG] Replacing Sketch with {move_name} at index {k}")
-                                                    self.player2.current_pokemon.moves[k] = self.player1.current_pokemon.moves[j]
-                                                    self.battle_message = f"{self.player2.current_pokemon.name} learned {move_name}!"
-                                                    self.draw_battle_message(1.3)
-                                                    self.battle_message = ""
-                                                    self.draw_battle_message(0)
-                                                    print(f"[DEBUG] {self.battle_message}")
-                                                    break
-                            break
+                winner = self.sync_online_speed_tie(effective_action1, action2)
+                if winner is not None:
+                    print(f"[DEBUG] {winner} won the speed tie; both sides apply the same boost.")
                 if (action2 and len(action2) > 1 and action2[1] is not None and not isinstance(action2[1], int)
                     and self.player2.current_pokemon.name == action2[1].name
                     and action2[1].moves[action2[2]].name in self.prepared_moves and not PreparedFlag2) :
@@ -1725,17 +1638,9 @@ class Game:
                 if action1 and len(action1) > 0 and hasattr(action1[1], "moves"):
                     move_name = action1[1].moves[action1[2]].name
                     print(f"[DEBUG] Player1 used move: {move_name}")
-                    if move_name == 'Transform':
-                        print("[DEBUG] Player1 used Transform.")
-                        self.player1.current_pokemon.moves = self.player1.opponent.current_pokemon.moves
-                        self.pokemon_images[self.player1.current_pokemon.name] = self.pokemon_images[self.player1.opponent.current_pokemon.name]
                 if action2 and len(action2) > 0 and hasattr(action2[1], "moves"):
                     move_name = action2[1].moves[action2[2]].name
                     print(f"[DEBUG] Player2 used move: {move_name}")
-                    if move_name == 'Transform':
-                        print("[DEBUG] Player2 used Transform.")
-                        self.player2.current_pokemon.moves = self.player2.opponent.current_pokemon.moves
-                        self.pokemon_images[self.player2.current_pokemon.name] = self.pokemon_images[self.player2.opponent.current_pokemon.name]
             elif (not action1 and action2 and action2[0] == 'switch') or (not action2 and action1 and action1[0] == 'switch'):
                 print("[DEBUG] Condition met: One player resting, other switching.")
                 print(f"[DEBUG] Evaluated: not action1={not action1}, action2={action2}, action2[0]==switch={action2 and action2[0] == 'switch'}")
@@ -1750,17 +1655,9 @@ class Game:
                 if action1 and hasattr(action1[1], "moves"):
                     move_name = action1[1].moves[action1[2]].name
                     print(f"[DEBUG] Player1 used move: {move_name}")
-                    if move_name == 'Transform':
-                        print("[DEBUG] Player1 used Transform.")
-                        self.player1.current_pokemon.moves = self.player1.opponent.current_pokemon.moves
-                        self.pokemon_images[self.player1.current_pokemon.name] = self.pokemon_images[self.player1.opponent.current_pokemon.name]
                 if action2 and hasattr(action2[1], "moves"):
                     move_name = action2[1].moves[action2[2]].name
                     print(f"[DEBUG] Player2 used move: {move_name}")
-                    if move_name == 'Transform':
-                        print("[DEBUG] Player2 used Transform.")
-                        self.player2.current_pokemon.moves = self.player2.opponent.current_pokemon.moves
-                        self.pokemon_images[self.player2.current_pokemon.name] = self.pokemon_images[self.player2.opponent.current_pokemon.name]
             elif action1 and action1[0] == 'switch' and action2 and action2[0] == 'switch':
                 print("[DEBUG] Condition met: Both players used switch.")
                 print(f"[DEBUG] action1[0]: {action1[0]}, action2[0]: {action2[0]}")
@@ -1939,3 +1836,4 @@ class Game:
                 print("[DEBUG] End of switch block. Clearing player_to_switch.")
                 player_to_switch = []
             turn += 1
+        self.graceful_exit = True

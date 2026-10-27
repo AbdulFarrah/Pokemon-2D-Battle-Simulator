@@ -12,10 +12,17 @@ class Player:
     def handle_command(self, command, computer=0):
         while True:
             if command.lower() == 'fight':
-                valid_moves = []
+                valid_moves = [i for i, move in enumerate(self.current_pokemon.moves) if move.pp > 0]
+                if not valid_moves:
+                    if computer:
+                        bench = [i for i, pokemon in enumerate(self.pokemons)
+                                 if pokemon.hp > 0 and i != self.current_pokemon_index]
+                        if bench:
+                            return ('switch', self.current_pokemon_index, random.choice(bench))
+                    print("No moves have PP remaining. Switch Pokémon or exit the match.")
+                    return None
                 # choose a move
                 for i, m in enumerate(self.current_pokemon.moves):
-                    valid_moves.append(i)
                     if len(self.current_pokemon.moves) > 1:
                         if (self.game_mode == "1" and computer == 0) or (self.game_mode == "2"):
                             print('({}): {} : ({}) ({}/{})'.format(i, m.name,m.type,m.pp, m.max_pp))

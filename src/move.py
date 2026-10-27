@@ -18,4 +18,5 @@ class Move:
             self.accuracy = json_data['Accuracy']
 
     def update_pp(self, delta):
-        self.pp += delta
+        self.pp = max(0, min(self.max_pp, self.pp + delta))
+        return self.pp

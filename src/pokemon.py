@@ -1,16 +1,23 @@
 import math
+from copy import copy
 
 class Pokemon:
-    def __init__(self, moves, json_data, lv=50, iv=[31, 31, 31, 31, 31, 31], ev=[0, 0, 0 ,0, 0, 0]):
+    def __init__(self, moves, json_data, lv=50, iv=None, ev=None):
         
         self.lv = lv
-        self.iv = iv
-        self.ev = ev
+        self.iv = list(iv if iv is not None else [31, 31, 31, 31, 31, 31])
+        self.ev = list(ev if ev is not None else [0, 0, 0, 0, 0, 0])
         self.moves = moves
         self.last_move_used = None
+        self.last_opponent_move_seen = None
+        self.original_moves = None
+        self.transformed_image = None
         self.name = json_data['Name']
         self.types = json_data['Types'] # convert str to list
-        self.hp = self.calculate_hp(int(json_data['hp']), self.iv[0], self.ev[0])
+        self.max_hp = self.calculate_hp(int(json_data['hp']), self.iv[0], self.ev[0])
+        self.hp = self.max_hp
+        self.fainted = False
+        self.faint_recorded = False
         self.attack = self.calculate_other(int(json_data['attack']), self.iv[1], self.ev[1])
         self.defense = self.calculate_other(int(json_data['defense']), self.iv[2], self.ev[2])
         self.sp_attack = self.calculate_other(int(json_data['special_attack']), self.iv[3], self.ev[3])
@@ -25,4 +32,25 @@ class Pokemon:
         return math.floor(math.floor(((2 * (base + iv) + math.floor(ev / 4)) * self.lv)/100) + 5)
 
     def update_hp(self, delta):
-        self.hp += delta
+        if self.hp <= 0:
+            self.fainted = True
+        if self.fainted and delta > 0:
+            return 0
+        previous_hp = self.hp
+        self.hp = max(0, min(self.max_hp, self.hp + delta))
+        if self.hp == 0:
+            self.fainted = True
+        return self.hp - previous_hp
+
+    def transform_into(self, moves):
+        if self.original_moves is None:
+            self.original_moves = self.moves
+        self.moves = [copy(move) for move in moves]
+        for move in self.moves:
+            move.pp = move.max_pp
+
+    def revert_transformation(self):
+        if self.original_moves is not None:
+            self.moves = self.original_moves
+            self.original_moves = None
+        self.transformed_image = None

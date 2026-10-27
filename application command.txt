@@ -1,0 +1,7 @@
+# WINDOWS: run in Command Prompt or PowerShell from the project directory.
+# Builds dist\pokemon_ONLINE_Game.exe with no console window.
+pyinstaller --clean pokemon_ONLINE_Game.spec
+
+# LINUX / WSL: run in a Linux shell from the project directory.
+# Builds dist/pokemon_ONLINE_Game for Linux. PyInstaller ignores console=False on Linux.
+pyinstaller --clean pokemon_ONLINE_Game.spec

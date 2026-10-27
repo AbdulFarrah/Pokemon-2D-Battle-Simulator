@@ -1,212 +1,196 @@
 import base64
+import html
 import json
 import os
-import pygame
+import re
+import tempfile
 from collections import deque
+from io import BytesIO
+from pathlib import Path
 
-pygame.init()
-pygame.display.set_mode((1, 1))
-max_width, max_height = 80, 80
-threshold = 240  # White threshold
 
-def remove_white_background(image, threshold=240):
-    w, h = image.get_size()
-    visited = [[False for _ in range(h)] for _ in range(w)]
-    queue = deque()
-
-    # Start flood fill from all four edges
-    for x in range(w):
-        queue.append((x, 0))
-        queue.append((x, h - 1))
-    for y in range(h):
-        queue.append((0, y))
-        queue.append((w - 1, y))
-
-    while queue:
-        x, y = queue.popleft()
-        if not (0 <= x < w and 0 <= y < h) or visited[x][y]:
-            continue
-
-        r, g, b, a = image.get_at((x, y))
-        if r >= threshold and g >= threshold and b >= threshold:
-            image.set_at((x, y), (255, 255, 255, 0))
-            visited[x][y] = True
-            # Explore 4-connected neighbors
-            queue.extend([(x+1, y), (x-1, y), (x, y+1), (x, y-1)])
-        else:
-            visited[x][y] = True  # Stop going deeper if not white
-
-    return image
-
-# Ensure the output directory exists
-output_dir = "./Images"
-os.makedirs(output_dir, exist_ok=True)
-
-# Load the JSON
-with open('pokemon.json', 'r') as f:
-    data = json.load(f)
-
-# Process each Pokémon entry
-for pokemon in data.get("pokemons", []):
-    name = pokemon.get("Name", "unknown").replace("/", "_").replace(" ", "_")
-    b64_string = pokemon.get("IMAGE")
-    output_path = os.path.join(output_dir, f"{name}.png")
-    
-    if os.path.exists(output_path):
-        continue
-    
-    if not b64_string:
-        print(f"⚠️ No image found for {name}. Skipping.")
-        continue
-
-    try:
-        temp_path = os.path.join(output_dir, f"__temp__{name}.png")
-        with open(temp_path, "wb") as img_file:
-            img_file.write(base64.b64decode(b64_string))
-
-        # Load with Pygame
-        image = pygame.image.load(temp_path).convert_alpha()
-        image = pygame.transform.smoothscale(image, (max_width, max_height))
-
-        # Remove white background from outer edge only
-        processed_image = remove_white_background(image, threshold)
-
-        # Save the processed image
-        pygame.image.save(processed_image, output_path)
-
-        # Clean up temp file
-        os.remove(temp_path)
-
-        print(f"✅ Saved image: {output_path}")
-    except Exception as e:
-        print(f"❌ Failed to save image for {name}: {e}")
-
-# Type colors for hover effects
-type_colors = {
-    "fire": "#f08030",
-    "water": "#3399ff",
-    "grass": "#78c850",
-    "electric": "#f8d030",
-    "bug": "#a8b820",
-    "normal": "#a8a878",
-    "psychic": "#f85888",
-    "ghost": "#705898",
-    "dragon": "#7038f8",
-    "dark": "#705848",
-    "fairy": "#ee99ac",
-    "ice": "#98d8d8",
-    "fighting": "#c03028",
-    "poison": "#a040a0",
-    "rock": "#b8a038",
-    "steel": "#b8b8d0",
-    "ground": "#e0c068"
+DATA_DIR = Path(__file__).resolve().parent
+IMAGE_DIR = DATA_DIR / "Images"
+MAX_SIZE = (80, 80)
+WHITE_THRESHOLD = 240
+TYPE_COLORS = {
+    "fire": "#f08030", "water": "#3399ff", "grass": "#78c850",
+    "electric": "#f8d030", "bug": "#a8b820", "normal": "#a8a878",
+    "psychic": "#f85888", "ghost": "#705898", "dragon": "#7038f8",
+    "dark": "#705848", "fairy": "#ee99ac", "ice": "#98d8d8",
+    "fighting": "#c03028", "poison": "#a040a0", "rock": "#b8a038",
+    "steel": "#b8b8d0", "ground": "#e0c068",
 }
 
-# HTML template start
-html_start = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>Pokémon Gallery</title>
-    <style>
-        body { font-family: Arial, sans-serif; padding: 20px; background: #000000; color: #ffffff; }
-        h1 { text-align: center; }
-        .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 20px; padding: 20px; }
-        .card { 
-            background: #1e1e1e; padding: 10px; border-radius: 10px; text-align: center; 
-            box-shadow: 0 2px 5px rgba(255,255,255,0.1); position: relative; 
-            overflow: hidden;
-        }
-        img { max-width: 100%; height: auto; }
-        
-        /* Hidden info section, displayed on hover */
-        .info {
-            display: none;
-            position: absolute;
-            top: 0; left: 0; right: 0; bottom: 0;
-            background: rgba(0, 0, 0, 0.7);
-            color: #ffffff;
-            padding: 10px;
-            text-align: left;
-            font-size: 14px;
-        }
-        
-        .card:hover .info {
-            display: block;
-        }
 
-        .type {
-            display: inline-block;
-            padding: 5px 10px;
-            border-radius: 5px;
-            margin-top: 5px;
-        }
-        
-        /* Type colors */
-        .fire { background-color: #f08030; }
-        .water { background-color: #3399ff; }
-        .grass { background-color: #78c850; }
-        .electric { background-color: #f8d030; }
-        .bug { background-color: #a8b820; }
-        .normal { background-color: #a8a878; }
-        .psychic { background-color: #f85888; }
-        .ghost { background-color: #705898; }
-        .dragon { background-color: #7038f8; }
-        .dark { background-color: #705848; }
-        .fairy { background-color: #ee99ac; }
-        .ice { background-color: #98d8d8; }
-        .fighting { background-color: #c03028; }
-        .poison { background-color: #a040a0; }
-        .rock { background-color: #b8a038; }
-        .steel { background-color: #b8b8d0; }
-        .ground { background-color: #e0c068; }
-        
-    </style>
-</head>
-<body>
-    <h1>Pokémon Gallery</h1>
-    <div class="gallery">
-"""
+def remove_white_background(image, threshold=WHITE_THRESHOLD):
+    width, height = image.get_size()
+    visited = [[False] * height for _ in range(width)]
+    queue = deque()
+    for x in range(width):
+        queue.append((x, 0))
+        queue.append((x, height - 1))
+    for y in range(height):
+        queue.append((0, y))
+        queue.append((width - 1, y))
+    while queue:
+        x, y = queue.popleft()
+        if not (0 <= x < width and 0 <= y < height) or visited[x][y]:
+            continue
+        red, green, blue, _alpha = image.get_at((x, y))
+        visited[x][y] = True
+        if red >= threshold and green >= threshold and blue >= threshold:
+            image.set_at((x, y), (255, 255, 255, 0))
+            queue.extend(((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)))
+    return image
 
-# HTML entries
-html_entries = ""
-for pokemon in data.get("pokemons", []):
-    name = pokemon.get("Name", "Unknown").replace("/", "_").replace(" ", "_")
-    image_path = f"./Images/{name}.png"
-    
-    if os.path.exists(image_path):
-        # Get the Pokémon's types and abilities
+
+def image_filename(name):
+    safe_name = re.sub(r'[<>:"/\\\\|?*]', "_", name).replace(" ", "_")
+    return safe_name + ".png"
+
+
+def valid_png(path, pygame):
+    try:
+        pygame.image.load(str(path))
+        return True
+    except (pygame.error, OSError, ValueError):
+        return False
+
+
+def generate_image(pokemon, output_path, pygame):
+    encoded = pokemon.get("IMAGE")
+    if not isinstance(encoded, str) or not encoded:
+        return False, "missing encoded image data"
+    temp_path = None
+    try:
+        raw_image = base64.b64decode(encoded, validate=True)
+        image = pygame.image.load(BytesIO(raw_image), pokemon.get("Name", "pokemon"))
+        image = pygame.transform.smoothscale(image.convert_alpha(), MAX_SIZE)
+        image = remove_white_background(image)
+        with tempfile.NamedTemporaryFile(dir=output_path.parent, prefix=".pokemon-",
+                                         suffix=".tmp.png", delete=False) as temp_file:
+            temp_path = Path(temp_file.name)
+        pygame.image.save(image, str(temp_path))
+        if not valid_png(temp_path, pygame):
+            raise ValueError("image encoder produced an invalid PNG")
+        os.replace(temp_path, output_path)
+        return True, None
+    except (ValueError, OSError, base64.binascii.Error, pygame.error) as exc:
+        return False, str(exc)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+
+
+def build_gallery(pokemons, image_dir, output_path):
+    entries = []
+    for pokemon in pokemons:
+        name = str(pokemon.get("Name", "Unknown"))
+        if not (image_dir / image_filename(name)).is_file():
+            continue
+        safe_name = html.escape(name, quote=True)
         types = pokemon.get("Types", [])
         abilities = pokemon.get("Abilities", [])
-        generation = pokemon.get("Generation", "Unknown")
-        
-        # Create the HTML for the Pokémon card
-        type_classes = " ".join([t.lower() for t in types])
-        type_spans = "".join([f'<span class="type {t.lower()}">{t}</span>' for t in types])
+        if not isinstance(types, list):
+            types = []
+        if not isinstance(abilities, list):
+            abilities = []
+        type_spans = "".join(
+            f'<span class="type {html.escape(str(item).lower(), quote=True)}">'
+            f'{html.escape(str(item))}</span>' for item in types
+        )
+        ability_text = html.escape(", ".join(map(str, abilities)))
+        generation = html.escape(str(pokemon.get("Generation", "Unknown")))
+        image_src = html.escape(f"./Images/{image_filename(name)}", quote=True)
+        entries.append(f"""<div class="card">
+            <img src="{image_src}" alt="{safe_name}">
+            <div class="info"><div><strong>Generation:</strong> {generation}</div>
+            <div><strong>Name:</strong> {safe_name}</div><div><strong>Type:</strong> {type_spans}</div>
+            <div><strong>Abilities:</strong> {ability_text}</div></div>
+        </div>""")
+    type_css = "".join(f".{name}{{background-color:{color}}}" for name, color in TYPE_COLORS.items())
+    template = """<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+    <title>Pokémon Gallery</title><style>
+    body{font-family:Arial,sans-serif;padding:20px;background:#000;color:#fff}
+    h1{text-align:center}.gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:20px;padding:20px}
+    .card{background:#1e1e1e;padding:10px;border-radius:10px;text-align:center;position:relative;overflow:hidden}
+    img{max-width:100%;height:auto}.info{display:none;position:absolute;inset:0;background:#000b;padding:10px;text-align:left}
+    .card:hover .info{display:block}.type{display:inline-block;padding:5px 10px;border-radius:5px;margin:5px}
+    {type_css}</style></head><body><h1>Pokémon Gallery</h1><div class="gallery">\n""".replace(
+        "{type_css}", type_css
+    )
+    output = template + "\n".join(entries) + "\n</div></body></html>"
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=output_path.parent,
+                                         prefix=f".{output_path.name}.", suffix=".tmp", delete=False) as temp:
+            temp_name = temp.name
+            temp.write(output)
+            temp.flush()
+            os.fsync(temp.fileno())
+        os.replace(temp_name, output_path)
+    finally:
+        if temp_name and os.path.exists(temp_name):
+            os.unlink(temp_name)
 
-        # Add the Pokémon card with hover details
-        html_entries += f"""
-        <div class="card">
-            <img src="{image_path}" alt="{name}">
-            <div class="info">
-                <div><strong>Generation:</strong> {generation}</div>
-                <div><strong>Name:</strong> {pokemon.get("Name", "Unknown")}</div>
-                <div><strong>Type:</strong> {type_spans}</div>
-                <div><strong>Abilities:</strong> {', '.join(abilities)}</div>
-            </div>
-        </div>
-        """
 
-# HTML template end
-html_end = """
-    </div>
-</body>
-</html>
-"""
+def main():
+    pokemon_path = DATA_DIR / "pokemon.json"
+    try:
+        data = json.loads(pokemon_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        print(f"Could not read Pokémon data at {pokemon_path}: {exc}")
+        return 1
+    if not isinstance(data, dict) or not isinstance(data.get("pokemons"), list):
+        print(f"Invalid Pokémon data structure in {pokemon_path}; no files were changed.")
+        return 1
 
-# Write HTML to file
-with open("gallery.html", "w", encoding="utf-8") as f:
-    f.write(html_start + html_entries + html_end)
+    try:
+        import pygame
+    except ImportError as exc:
+        print(f"Pygame is required to generate images: {exc}")
+        return 1
+    try:
+        pygame.init()
+        pygame.display.set_mode((1, 1))
+    except pygame.error as exc:
+        print(f"Pygame could not initialize image processing: {exc}")
+        return 1
 
-print("✅ HTML gallery saved as gallery.html")
+    IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+    unresolved = []
+    for pokemon in data["pokemons"]:
+        if not isinstance(pokemon, dict) or not isinstance(pokemon.get("Name"), str):
+            unresolved.append(str(pokemon))
+            print("Skipping malformed Pokémon record.")
+            continue
+        name = pokemon["Name"]
+        output_path = IMAGE_DIR / image_filename(name)
+        if output_path.is_file() and valid_png(output_path, pygame):
+            continue
+        generated, error = generate_image(pokemon, output_path, pygame)
+        if generated:
+            print(f"✅ Added/refreshed image: {output_path.name}")
+        else:
+            unresolved.append(name)
+            print(f"❌ Could not create image for {name}: {error}")
+
+    try:
+        build_gallery(data["pokemons"], IMAGE_DIR, DATA_DIR / "gallery.html")
+    except OSError as exc:
+        print(f"Could not write gallery.html: {exc}")
+        return 1
+    pygame.quit()
+    if unresolved:
+        print(f"Unresolved images ({len(unresolved)}): {', '.join(unresolved)}")
+        return 1
+    print("✅ Pokémon images and gallery are up to date.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
