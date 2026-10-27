@@ -25,7 +25,7 @@ The game reads these paths relative to the project root (or the packaged applica
 - `data/data.json`
 - `data/Images/`, including `background.png` and the generated Pokémon sprites
 
-`data/pokemon.json` and generated Pokémon PNGs are ignored by Git. On a fresh checkout, create or update the data from the project root:
+`data/pokemon.json` and generated Pokémon PNGs are ignored by Git. `data/data.json` and `data/Images/background.png` are included in the repository. On a fresh checkout, create the missing Pokémon records and sprites from the project root:
 
 ```sh
 python data/pokemon_fetcher.py
@@ -33,7 +33,7 @@ python data/move_fetcher.py
 python data/image_fetcher.py
 ```
 
-The fetchers make network requests. They are safe to import; work starts only when a script is run directly. Existing valid Pokémon data and images are kept, missing entries are added, and invalid or missing sprites are regenerated.
+The fetchers make network requests, so an internet connection is required. They are safe to import; work starts only when a script is run directly. Existing valid Pokémon data and images are kept, missing entries are added, and invalid or missing sprites are regenerated. If a fetch reports unresolved records, rerun that script to retry them before building.
 
 ## Run from source
 
@@ -47,11 +47,17 @@ At startup, the game validates the data files and Pokémon images before showing
 
 ## Build a standalone application
 
-Build on the operating system you intend to run. PyInstaller does not cross-compile between Windows and Linux. The commands are also listed in `application command.txt`.
+Build on the operating system you intend to run. PyInstaller does not cross-compile between Windows and Linux. The data-generation steps above must finish first because PyInstaller requires `data/pokemon.json` and the generated sprites to exist.
+
+The repository intentionally ignores `pokemon_ONLINE_Game.spec`, so a fresh clone will not have the spec file. Install PyInstaller using the Requirements command above, then create the spec once with the command for your platform. Run these commands from the project root.
 
 **Windows** — run from Command Prompt or PowerShell in the project root:
 
 ```powershell
+# Create the spec only if pokemon_ONLINE_Game.spec is missing.
+pyi-makespec --onefile --windowed --name pokemon_ONLINE_Game --icon "assets/Poké_Ball.ico" --add-data "data/pokemon.json;data" --add-data "data/data.json;data" --add-data "data/Images;data/Images" --add-data "src;src" main.py
+
+# Build (run this on later builds when the spec already exists).
 pyinstaller --clean pokemon_ONLINE_Game.spec
 ```
 
@@ -60,12 +66,16 @@ This creates `dist\pokemon_ONLINE_Game.exe`. The spec uses a windowed build, so 
 **Linux / WSL** — run from a Linux shell in the project root:
 
 ```sh
+# Create the spec only if pokemon_ONLINE_Game.spec is missing.
+pyi-makespec --onefile --windowed --name pokemon_ONLINE_Game --icon "assets/Poké_Ball.ico" --add-data "data/pokemon.json:data" --add-data "data/data.json:data" --add-data "data/Images:data/Images" --add-data "src:src" main.py
+
+# Build (run this on later builds when the spec already exists).
 pyinstaller --clean pokemon_ONLINE_Game.spec
 ```
 
 This creates `dist/pokemon_ONLINE_Game`. PyInstaller ignores the spec’s `console=False` setting on Linux. Launching from a terminal writes debug output to that terminal; launching from a desktop menu normally does not open one.
 
-The `dist/` executable is native to the build platform. A Windows `.exe` must be built on Windows; a Linux executable must be built on Linux.
+The `dist/` executable is native to the build platform. A Windows `.exe` must be built on Windows; a Linux executable must be built on Linux. Both platform-specific commands are also kept in `application command.txt`.
 
 ## Controls
 
@@ -75,7 +85,7 @@ The `dist/` executable is native to the build platform. A Windows `.exe` must be
 - On the invite-code screen, the host can click **Copy Code** or press Ctrl+C. The joining player can paste with Ctrl+V.
 - Press Enter to close the party list; it also closes automatically after five seconds.
 
-Battle actions are Fight, Switch, List, and Exit. Moves with no PP cannot be selected. If all active Pokémon’s moves are exhausted, switch, view the team, or exit. In local PvP, Exit forfeits the match.
+Battle actions are Fight, Switch, List, and Exit. Moves with no PP cannot be selected. If all active Pokémon’s moves are exhausted, switch, view the team, or exit. Healing is capped at maximum HP and reports when no HP was recovered. In local PvP, Exit forfeits the match.
 
 ## Online play
 

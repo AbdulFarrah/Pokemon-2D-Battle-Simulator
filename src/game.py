@@ -1238,20 +1238,26 @@ class Game:
         move.update_pp(-1)
         if (move.name in self.heal_user_moves):
             recovered = pokemon1.update_hp(pokemon1.max_hp // 2)
-            self.battle_message = f"{pokemon1.name} recovered its HP by {recovered}..."
+            self.battle_message = (f"{pokemon1.name}'s HP is already full."
+                                   if recovered == 0 else
+                                   f"{pokemon1.name} recovered its HP by {recovered}...")
             self.draw_battle_message(1.3)    
             self.battle_message = ""
             self.draw_battle_message(0)  
         elif (move.name in self.heal_target_moves):
             recovered = pokemon2.update_hp(pokemon2.max_hp // 2)
-            self.battle_message = f"{pokemon2.name} recovered its HP by {recovered}..."
+            self.battle_message = (f"{pokemon2.name}'s HP is already full."
+                                   if recovered == 0 else
+                                   f"{pokemon2.name} recovered its HP by {recovered}...")
             self.draw_battle_message(1.3)
             self.battle_message = ""
             self.draw_battle_message(0)
         elif (move.name in self.drain_moves):
             damage_removed = -pokemon2.update_hp(-damage_dealt[0])
             recovered = pokemon1.update_hp(damage_removed)
-            self.battle_message = f"{pokemon1.name} recovered its HP by {recovered}..."
+            self.battle_message = (f"{pokemon1.name}'s HP is already full."
+                                   if recovered == 0 else
+                                   f"{pokemon1.name} recovered its HP by {recovered}...")
             self.draw_battle_message(1.3)   
             self.battle_message = ""
             self.draw_battle_message(0)    

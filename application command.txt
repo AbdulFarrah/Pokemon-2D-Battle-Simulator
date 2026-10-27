@@ -1,7 +1,15 @@
-# WINDOWS: run in Command Prompt or PowerShell from the project directory.
-# Builds dist\pokemon_ONLINE_Game.exe with no console window.
+# Build on the same operating system where you will run the application.
+# Before building, generate the ignored runtime data as described in README.md.
+# Install PyInstaller with: python -m pip install pyinstaller
+
+# WINDOWS (Command Prompt or PowerShell, from the project directory)
+# If pokemon_ONLINE_Game.spec does not exist yet, create it once with:
+pyi-makespec --onefile --windowed --name pokemon_ONLINE_Game --icon "assets/Poké_Ball.ico" --add-data "data/pokemon.json;data" --add-data "data/data.json;data" --add-data "data/Images;data/Images" --add-data "src;src" main.py
+# If pokemon_ONLINE_Game.spec already exists, skip the command above and run:
 pyinstaller --clean pokemon_ONLINE_Game.spec
 
-# LINUX / WSL: run in a Linux shell from the project directory.
-# Builds dist/pokemon_ONLINE_Game for Linux. PyInstaller ignores console=False on Linux.
+# LINUX / WSL (shell, from the project directory)
+# If pokemon_ONLINE_Game.spec does not exist yet, create it once with:
+pyi-makespec --onefile --windowed --name pokemon_ONLINE_Game --icon "assets/Poké_Ball.ico" --add-data "data/pokemon.json:data" --add-data "data/data.json:data" --add-data "data/Images:data/Images" --add-data "src:src" main.py
+# If pokemon_ONLINE_Game.spec already exists, skip the command above and run:
 pyinstaller --clean pokemon_ONLINE_Game.spec
